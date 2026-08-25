@@ -174,15 +174,10 @@ impl<H: Handle, C: Config, SERVER: DisplayServer<H>> Manager<H, C, SERVER> {
                 above_changed = states.contains(&WindowState::Above)
                     != window.states.contains(&WindowState::Above);
             }
-            let container = match find_transient_parent(&windows, window.transient) {
-                Some(parent) => Some(parent.exact_xyhw()),
-                None if window.r#type == WindowType::Dialog => self
-                    .state
-                    .workspaces
-                    .iter()
-                    .find(|ws| ws.tag == window.tag)
-                    .map(|ws| ws.xyhw),
-                _ => None,
+            let container = if window.r#type.is_dialog_like() {
+                None
+            } else {
+                find_transient_parent(&windows, window.transient).map(Window::exact_xyhw)
             };
 
             changed = change.update(window, container);
@@ -396,6 +391,15 @@ fn set_relative_floating<H: Handle>(window: &mut Window<H>, ws: &Workspace, oute
     window.set_floating_exact(xyhw);
 }
 
+// Dialog-like windows already carry the geometry selected by their client. Keep that geometry
+// instead of replacing its position with LeftWM's centering policy.
+fn set_requested_floating<H: Handle>(window: &mut Window<H>, ws: &Workspace) {
+    window.set_floating(true);
+    window.normal = ws.xyhw;
+    let xyhw = window.requested.unwrap_or_else(|| ws.center_halfed());
+    window.set_floating_exact(xyhw);
+}
+
 fn setup_window<H: Handle>(
     state: &mut State<H>,
     window: &mut Window<H>,
@@ -461,6 +465,13 @@ fn setup_window<H: Handle>(
         }
     }
 
+    // Dialog-like clients are responsible for their own geometry. This must run before transient
+    // handling, which intentionally centers normal child windows relative to their parent.
+    if window.r#type.is_dialog_like() {
+        set_requested_floating(window, ws);
+        return;
+    }
+
     // Setup a child window.
     if let Some(parent) = find_transient_parent(&state.windows, window.transient) {
         // This is currently for vlc, this probably will need to be more general if another
@@ -472,17 +483,11 @@ fn setup_window<H: Handle>(
     }
 
     // Setup window based on type.
-    match window.r#type {
-        WindowType::Normal => {
-            window.apply_margin_multiplier(ws.margin_multiplier);
-            if window.floating() {
-                set_relative_floating(window, ws, ws.xyhw_avoided);
-            }
-        }
-        WindowType::Dialog | WindowType::Splash => {
+    if window.r#type == WindowType::Normal {
+        window.apply_margin_multiplier(ws.margin_multiplier);
+        if window.floating() {
             set_relative_floating(window, ws, ws.xyhw_avoided);
         }
-        _ => {}
     }
 }
 
@@ -516,7 +521,7 @@ mod tests {
     use super::*;
     use crate::Manager;
     use crate::layouts::MONOCLE;
-    use crate::models::{MockHandle, Screen};
+    use crate::models::{MockHandle, Screen, XyhwBuilder, XyhwChange};
 
     fn last_window_order(state: &State<MockHandle>) -> Vec<WindowHandle<MockHandle>> {
         state
@@ -528,6 +533,139 @@ mod tests {
                 _ => None,
             })
             .expect("expected a window order action")
+    }
+
+    fn dialog_like_types() -> [WindowType; 10] {
+        [
+            WindowType::Dialog,
+            WindowType::Splash,
+            WindowType::Utility,
+            WindowType::Menu,
+            WindowType::DropdownMenu,
+            WindowType::PopupMenu,
+            WindowType::Tooltip,
+            WindowType::Notification,
+            WindowType::Combo,
+            WindowType::Dnd,
+        ]
+    }
+
+    #[test]
+    fn dialog_like_windows_keep_their_requested_geometry() {
+        let requested: Xyhw = XyhwBuilder {
+            x: 120,
+            y: 80,
+            w: 240,
+            h: 160,
+            ..XyhwBuilder::default()
+        }
+        .into();
+
+        for (handle, window_type) in dialog_like_types().into_iter().enumerate() {
+            let mut manager = Manager::new_test(vec!["1".to_owned()]);
+            manager.screen_create_handler(Screen::default());
+
+            let handle = WindowHandle::<MockHandle>(handle as i32 + 1);
+            let mut window = Window::new(handle, None, None);
+            window.r#type = window_type;
+            window.requested = Some(requested);
+            manager.window_created_handler(window, -1, -1);
+
+            let actual = manager
+                .state
+                .windows
+                .iter()
+                .find(|window| window.handle == handle)
+                .expect("expected the dialog-like window")
+                .exact_xyhw();
+            assert_eq!(actual, requested);
+        }
+    }
+
+    #[test]
+    fn dialog_like_windows_without_geometry_keep_the_centered_fallback() {
+        for (handle, window_type) in dialog_like_types().into_iter().enumerate() {
+            let mut manager = Manager::new_test(vec!["1".to_owned()]);
+            manager.screen_create_handler(Screen::default());
+            let expected = manager.state.workspaces[0].center_halfed();
+
+            let handle = WindowHandle::<MockHandle>(handle as i32 + 1);
+            let mut window = Window::new(handle, None, None);
+            window.r#type = window_type;
+            manager.window_created_handler(window, -1, -1);
+
+            let actual = manager
+                .state
+                .windows
+                .iter()
+                .find(|window| window.handle == handle)
+                .expect("expected the dialog-like window")
+                .exact_xyhw();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn dialog_like_configure_changes_only_update_requested_fields() {
+        for (index, window_type) in dialog_like_types().into_iter().enumerate() {
+            let mut manager = Manager::new_test(vec!["1".to_owned()]);
+            manager.screen_create_handler(Screen::default());
+
+            let parent_handle = WindowHandle::<MockHandle>(1);
+            manager.window_created_handler(Window::new(parent_handle, None, None), -1, -1);
+
+            let requested: Xyhw = XyhwBuilder {
+                x: 120,
+                y: 80,
+                w: 240,
+                h: 160,
+                ..XyhwBuilder::default()
+            }
+            .into();
+            let handle = WindowHandle::<MockHandle>(index as i32 + 2);
+            let mut window = Window::new(handle, None, None);
+            window.r#type = window_type;
+            window.transient = Some(parent_handle);
+            window.border = 0;
+            window.requested = Some(requested);
+            manager.window_created_handler(window, -1, -1);
+
+            let mut resize = WindowChange::new(handle);
+            resize.floating = Some(XyhwChange {
+                w: Some(300),
+                h: Some(190),
+                ..XyhwChange::default()
+            });
+            manager.window_changed_handler(resize);
+
+            let resized = manager
+                .state
+                .windows
+                .iter()
+                .find(|window| window.handle == handle)
+                .expect("expected the resized dialog-like window")
+                .exact_xyhw();
+            assert_eq!((resized.x(), resized.y()), (120, 80));
+            assert_eq!((resized.w(), resized.h()), (300, 190));
+
+            let mut movement = WindowChange::new(handle);
+            movement.floating = Some(XyhwChange {
+                x: Some(-40),
+                y: Some(210),
+                ..XyhwChange::default()
+            });
+            manager.window_changed_handler(movement);
+
+            let moved = manager
+                .state
+                .windows
+                .iter()
+                .find(|window| window.handle == handle)
+                .expect("expected the moved dialog-like window")
+                .exact_xyhw();
+            assert_eq!((moved.x(), moved.y()), (-40, 210));
+            assert_eq!((moved.w(), moved.h()), (300, 190));
+        }
     }
 
     #[test]
