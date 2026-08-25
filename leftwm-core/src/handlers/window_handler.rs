@@ -45,7 +45,8 @@ impl<H: Handle, C: Config, SERVER: DisplayServer<H>> Manager<H, C, SERVER> {
             && self.state.focus_manager.behaviour.is_sloppy()
             && self.state.focus_manager.sloppy_mouse_follows_focus
             && window.is_managed()
-            && on_same_tag;
+            && on_same_tag
+            && window.allows_mouse_warp();
 
         // Let the DS know we are managing this window.
         let act = DisplayAction::AddedWindow(window.handle, window.floating(), follow_mouse);
@@ -516,7 +517,7 @@ mod tests {
     use super::*;
     use crate::Manager;
     use crate::layouts::MONOCLE;
-    use crate::models::{MockHandle, Screen};
+    use crate::models::{FocusBehaviour, MockHandle, Screen};
 
     fn last_window_order(state: &State<MockHandle>) -> Vec<WindowHandle<MockHandle>> {
         state
@@ -528,6 +529,74 @@ mod tests {
                 _ => None,
             })
             .expect("expected a window order action")
+    }
+
+    fn follows_mouse_on_creation(
+        window: Window<MockHandle>,
+        focus_new_windows: bool,
+        focus_behaviour: FocusBehaviour,
+        sloppy_mouse_follows_focus: bool,
+    ) -> bool {
+        let mut manager = Manager::new_test(vec!["1".to_owned()]);
+        manager.screen_create_handler(Screen::default());
+        manager.state.actions.clear();
+        manager.state.focus_manager.focus_new_windows = focus_new_windows;
+        manager.state.focus_manager.behaviour = focus_behaviour;
+        manager.state.focus_manager.sloppy_mouse_follows_focus = sloppy_mouse_follows_focus;
+
+        manager.window_created_handler(window, -1, -1);
+
+        manager
+            .state
+            .actions
+            .iter()
+            .find_map(|action| match action {
+                DisplayAction::AddedWindow(_, _, follow_mouse) => Some(*follow_mouse),
+                _ => None,
+            })
+            .expect("expected an AddedWindow action")
+    }
+
+    #[test]
+    fn new_window_mouse_warp_uses_type_default_and_window_override() {
+        let cases = [
+            (1, WindowType::Normal, None, true),
+            (2, WindowType::Utility, None, false),
+            (3, WindowType::Normal, Some(true), false),
+            (4, WindowType::Utility, Some(false), true),
+        ];
+
+        for (handle, window_type, disable_mouse_grab, expected) in cases {
+            let mut window = Window::new(WindowHandle(handle), None, None);
+            window.r#type = window_type;
+            window.set_disable_mouse_grab(disable_mouse_grab);
+
+            assert_eq!(
+                follows_mouse_on_creation(window, true, FocusBehaviour::Sloppy, true),
+                expected,
+                "unexpected follow_mouse for disable_mouse_grab={disable_mouse_grab:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn mouse_warp_permission_does_not_bypass_global_focus_settings() {
+        let cases = [
+            (false, FocusBehaviour::Sloppy, true),
+            (true, FocusBehaviour::ClickTo, true),
+            (true, FocusBehaviour::Sloppy, false),
+        ];
+
+        for (focus_new_windows, focus_behaviour, sloppy_mouse_follows_focus) in cases {
+            let window = Window::new(WindowHandle(1), None, None);
+
+            assert!(!follows_mouse_on_creation(
+                window,
+                focus_new_windows,
+                focus_behaviour,
+                sloppy_mouse_follows_focus,
+            ));
+        }
     }
 
     #[test]
