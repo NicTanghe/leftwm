@@ -269,6 +269,7 @@ pub struct Config {
     pub create_follows_cursor: Option<bool>,
     pub auto_derive_workspaces: bool,
     pub disable_cursor_reposition_on_resize: bool,
+    pub respect_dialog_position: bool,
     pub focus_on_activation: FocusOnActivationBehaviour,
     pub window_hiding_strategy: WindowHidingStrategy,
     #[cfg(feature = "lefthk")]
@@ -728,6 +729,10 @@ impl leftwm_core::Config for Config {
 
     fn reposition_cursor_on_resize(&self) -> bool {
         !self.disable_cursor_reposition_on_resize
+    }
+
+    fn respect_dialog_position(&self) -> bool {
+        self.respect_dialog_position
     }
 
     // Determines if a new window should be created under the cursor or on the workspace which has the focus

@@ -211,6 +211,13 @@ the cursor will be snapped to the lower right corner of the window which is
 being resized.
 .PP
 Default: \f[C]disable_cursor_reposition_on_resize = false\f[R]
+.SS Dialog Position
+.PP
+LeftWM centers dialog windows by default while retaining the dimensions requested
+by the client. Set \f[C]respect_dialog_position\f[R] to true to also retain the
+position requested by dialog-like windows.
+.PP
+Default: \f[C]respect_dialog_position = false\f[R]
 .SS Window Creation and Cursor Focus
 .PP
 In multi-workspace layouts (such as with multiple monitors), LeftWM

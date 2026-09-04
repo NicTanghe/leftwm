@@ -30,10 +30,12 @@ impl<H: Handle, C: Config, SERVER: DisplayServer<H>> Manager<H, C, SERVER> {
         let mut on_same_tag = true;
         // Random value
         let mut layout = MAIN_AND_VERT_STACK.to_string();
+        let respect_dialog_position = self.config.respect_dialog_position();
         setup_window(
             &mut self.state,
             &mut window,
             (x, y),
+            respect_dialog_position,
             &mut layout,
             &mut is_first,
             &mut on_same_tag,
@@ -159,6 +161,7 @@ impl<H: Handle, C: Config, SERVER: DisplayServer<H>> Manager<H, C, SERVER> {
         let mut transient_changed = false;
         let strut_changed = change.strut.is_some();
         let windows = self.state.windows.clone();
+        let respect_dialog_position = self.config.respect_dialog_position();
         if let Some(window) = self
             .state
             .windows
@@ -175,10 +178,19 @@ impl<H: Handle, C: Config, SERVER: DisplayServer<H>> Manager<H, C, SERVER> {
                 above_changed = states.contains(&WindowState::Above)
                     != window.states.contains(&WindowState::Above);
             }
-            let container = if window.r#type.is_dialog_like() {
+            let container = if respect_dialog_position && window.r#type.is_dialog_like() {
                 None
             } else {
-                find_transient_parent(&windows, window.transient).map(Window::exact_xyhw)
+                match find_transient_parent(&windows, window.transient) {
+                    Some(parent) => Some(parent.exact_xyhw()),
+                    None if window.r#type == WindowType::Dialog => self
+                        .state
+                        .workspaces
+                        .iter()
+                        .find(|ws| ws.tag == window.tag)
+                        .map(|ws| ws.xyhw),
+                    _ => None,
+                }
             };
 
             changed = change.update(window, container);
@@ -405,6 +417,7 @@ fn setup_window<H: Handle>(
     state: &mut State<H>,
     window: &mut Window<H>,
     xy: (i32, i32),
+    respect_dialog_position: bool,
     layout: &mut String,
     is_first: &mut bool,
     on_same_tag: &mut bool,
@@ -468,7 +481,7 @@ fn setup_window<H: Handle>(
 
     // Dialog-like clients are responsible for their own geometry. This must run before transient
     // handling, which intentionally centers normal child windows relative to their parent.
-    if window.r#type.is_dialog_like() {
+    if respect_dialog_position && window.r#type.is_dialog_like() {
         set_requested_floating(window, ws);
         return;
     }
@@ -484,11 +497,17 @@ fn setup_window<H: Handle>(
     }
 
     // Setup window based on type.
-    if window.r#type == WindowType::Normal {
-        window.apply_margin_multiplier(ws.margin_multiplier);
-        if window.floating() {
+    match window.r#type {
+        WindowType::Normal => {
+            window.apply_margin_multiplier(ws.margin_multiplier);
+            if window.floating() {
+                set_relative_floating(window, ws, ws.xyhw_avoided);
+            }
+        }
+        WindowType::Dialog | WindowType::Splash => {
             set_relative_floating(window, ws, ws.xyhw_avoided);
         }
+        _ => {}
     }
 }
 
@@ -600,7 +619,7 @@ mod tests {
     }
 
     #[test]
-    fn dialog_like_windows_keep_their_requested_geometry() {
+    fn dialog_like_windows_keep_their_requested_geometry_when_enabled() {
         let requested: Xyhw = XyhwBuilder {
             x: 120,
             y: 80,
@@ -612,6 +631,7 @@ mod tests {
 
         for (handle, window_type) in dialog_like_types().into_iter().enumerate() {
             let mut manager = Manager::new_test(vec!["1".to_owned()]);
+            manager.config.respect_dialog_position = true;
             manager.screen_create_handler(Screen::default());
 
             let handle = WindowHandle::<MockHandle>(handle as i32 + 1);
@@ -629,6 +649,39 @@ mod tests {
                 .exact_xyhw();
             assert_eq!(actual, requested);
         }
+    }
+
+    #[test]
+    fn dialog_windows_center_by_default_but_keep_their_requested_size() {
+        let mut manager = Manager::new_test(vec!["1".to_owned()]);
+        manager.screen_create_handler(Screen::default());
+
+        let requested: Xyhw = XyhwBuilder {
+            x: 120,
+            y: 80,
+            w: 240,
+            h: 160,
+            ..XyhwBuilder::default()
+        }
+        .into();
+        let handle = WindowHandle::<MockHandle>(1);
+        let mut window = Window::new(handle, None, None);
+        window.r#type = WindowType::Dialog;
+        window.requested = Some(requested);
+        let mut expected = requested;
+        expected.center_relative(manager.state.workspaces[0].xyhw_avoided, window.border);
+        manager.window_created_handler(window, -1, -1);
+
+        let actual = manager
+            .state
+            .windows
+            .iter()
+            .find(|window| window.handle == handle)
+            .expect("expected the dialog window")
+            .exact_xyhw();
+        assert_eq!(actual, expected);
+        assert_eq!((actual.w(), actual.h()), (requested.w(), requested.h()));
+        assert_ne!((actual.x(), actual.y()), (requested.x(), requested.y()));
     }
 
     #[test]
@@ -655,6 +708,7 @@ mod tests {
     fn dialog_like_windows_without_geometry_keep_the_centered_fallback() {
         for (handle, window_type) in dialog_like_types().into_iter().enumerate() {
             let mut manager = Manager::new_test(vec!["1".to_owned()]);
+            manager.config.respect_dialog_position = true;
             manager.screen_create_handler(Screen::default());
             let expected = manager.state.workspaces[0].center_halfed();
 
@@ -675,9 +729,10 @@ mod tests {
     }
 
     #[test]
-    fn dialog_like_configure_changes_only_update_requested_fields() {
+    fn dialog_like_configure_changes_only_update_requested_fields_when_enabled() {
         for (index, window_type) in dialog_like_types().into_iter().enumerate() {
             let mut manager = Manager::new_test(vec!["1".to_owned()]);
+            manager.config.respect_dialog_position = true;
             manager.screen_create_handler(Screen::default());
 
             let parent_handle = WindowHandle::<MockHandle>(1);
@@ -735,6 +790,69 @@ mod tests {
             assert_eq!((moved.x(), moved.y()), (-40, 210));
             assert_eq!((moved.w(), moved.h()), (300, 190));
         }
+    }
+
+    #[test]
+    fn dialog_configure_centers_by_default_but_keeps_the_requested_size() {
+        let mut manager = Manager::new_test(vec!["1".to_owned()]);
+        manager.screen_create_handler(Screen::default());
+
+        let parent_handle = WindowHandle::<MockHandle>(1);
+        manager.window_created_handler(Window::new(parent_handle, None, None), -1, -1);
+        let parent = manager
+            .state
+            .windows
+            .iter()
+            .find(|window| window.handle == parent_handle)
+            .expect("expected the parent window")
+            .exact_xyhw();
+
+        let handle = WindowHandle::<MockHandle>(2);
+        let mut window = Window::new(handle, None, None);
+        window.r#type = WindowType::Dialog;
+        window.transient = Some(parent_handle);
+        window.border = 0;
+        window.requested = Some(
+            XyhwBuilder {
+                x: 120,
+                y: 80,
+                w: 240,
+                h: 160,
+                ..XyhwBuilder::default()
+            }
+            .into(),
+        );
+        manager.window_created_handler(window, -1, -1);
+
+        let mut requested: Xyhw = XyhwBuilder {
+            x: -40,
+            y: 210,
+            w: 300,
+            h: 190,
+            ..XyhwBuilder::default()
+        }
+        .into();
+        let mut change = WindowChange::new(handle);
+        change.floating = Some(XyhwChange {
+            x: Some(requested.x()),
+            y: Some(requested.y()),
+            w: Some(requested.w()),
+            h: Some(requested.h()),
+            ..XyhwChange::default()
+        });
+        manager.window_changed_handler(change);
+
+        requested.center_relative(parent, 0);
+        let actual = manager
+            .state
+            .windows
+            .iter()
+            .find(|window| window.handle == handle)
+            .expect("expected the dialog window")
+            .exact_xyhw();
+        assert_eq!(actual, requested);
+        assert_eq!((actual.w(), actual.h()), (300, 190));
+        assert_ne!((actual.x(), actual.y()), (-40, 210));
     }
 
     #[test]
